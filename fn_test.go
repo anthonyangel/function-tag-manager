@@ -376,3 +376,93 @@ func TestIgnoreResource(t *testing.T) {
 		})
 	}
 }
+
+func TestRunFunctionGCP(t *testing.T) {
+	// GCP calls the field that holds tags `labels`. Check that the filters wire
+	// that through add, ignore and remove, and that resources that aren't
+	// managed are left alone.
+	req := &fnv1.RunFunctionRequest{
+		Meta: &fnv1.RequestMeta{Tag: "tag-manager"},
+		Input: resource.MustStructJSON(`{
+			"apiVersion": "tag-manager.fn.crossplane.io/v1beta1",
+			"kind": "ManagedTags",
+			"addTags": [{"type": "FromValue", "policy": "Replace", "tags": {"team": "platform"}}],
+			"ignoreTags": [{"type": "FromValue", "policy": "Replace", "keys": ["external"]}],
+			"removeTags": [{"type": "FromValue", "keys": ["remove"]}]
+		}`),
+		Observed: &fnv1.State{
+			Composite: &fnv1.Resource{Resource: resource.MustStructJSON(`{
+				"apiVersion": "example.crossplane.io/v1",
+				"kind": "XR",
+				"metadata": {"name": "xr"}
+			}`)},
+			Resources: map[string]*fnv1.Resource{
+				"bucket": {Resource: resource.MustStructJSON(`{
+					"apiVersion": "storage.gcp.upbound.io/v1beta1",
+					"kind": "Bucket",
+					"metadata": {"name": "bucket"},
+					"status": {"atProvider": {"labels": {"external": "set-elsewhere"}, "tags": {"external": "not-a-label"}}}
+				}`)},
+			},
+		},
+		Desired: &fnv1.State{
+			Resources: map[string]*fnv1.Resource{
+				"bucket": {Resource: resource.MustStructJSON(`{
+					"apiVersion": "storage.gcp.upbound.io/v1beta1",
+					"kind": "Bucket",
+					"metadata": {"name": "bucket"},
+					"spec": {"forProvider": {"labels": {"existing": "label", "remove": "me"}}}
+				}`)},
+				"namespacedBucket": {Resource: resource.MustStructJSON(`{
+					"apiVersion": "storage.gcp.m.upbound.io/v1beta1",
+					"kind": "Bucket",
+					"metadata": {"name": "namespaced-bucket", "namespace": "default"},
+					"spec": {"forProvider": {}}
+				}`)},
+				"bucketACL": {Resource: resource.MustStructJSON(`{
+					"apiVersion": "storage.gcp.upbound.io/v1beta1",
+					"kind": "BucketACL",
+					"metadata": {"name": "bucket-acl"},
+					"spec": {"forProvider": {}}
+				}`)},
+				"alertPolicy": {Resource: resource.MustStructJSON(`{
+					"apiVersion": "monitoring.gcp.upbound.io/v1beta1",
+					"kind": "AlertPolicy",
+					"metadata": {"name": "alert-policy"},
+					"spec": {"forProvider": {"userLabels": {"existing": "label"}}}
+				}`)},
+			},
+		},
+	}
+
+	want := map[string]map[string]any{
+		"bucket": {
+			"labels": map[string]any{"existing": "label", "team": "platform", "external": "set-elsewhere"},
+		},
+		"namespacedBucket": {
+			"labels": map[string]any{"team": "platform"},
+		},
+		"bucketACL": {},
+		"alertPolicy": {
+			"userLabels": map[string]any{"existing": "label"},
+		},
+	}
+
+	f := &Function{log: logging.NewNopLogger()}
+
+	rsp, err := f.RunFunction(context.Background(), req)
+	if err != nil {
+		t.Fatalf("f.RunFunction(...): unexpected error: %v", err)
+	}
+
+	got := map[string]map[string]any{}
+
+	for name, r := range rsp.GetDesired().GetResources() {
+		forProvider, _ := r.GetResource().AsMap()["spec"].(map[string]any)["forProvider"].(map[string]any)
+		got[name] = forProvider
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("f.RunFunction(...): spec.forProvider: -want, +got:\n%s", diff)
+	}
+}
