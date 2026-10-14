@@ -80,42 +80,35 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) 
 		return rsp, nil
 	}
 
-	resourceFilter := filters.NewResourceFilter()
-
 	// Resolve tags to remove once for all resources (doesn't depend on individual resources)
 	removeTags := f.ResolveRemoveTags(in.RemoveTags, oxr, env)
 
-	for name, desired := range desiredComposed {
-		if IgnoreResource(desired) {
-			f.log.Debug("skipping resource due to ignore annotation or label", "resource", string(name), "gvk", desired.Resource.GroupVersionKind().String())
-			continue
-		}
+	// Decide what to do to every resource, and check that the provider will
+	// accept the tags, before any resource is changed.
+	plans, err := f.PlanTags(in, oxr, env, desiredComposed, observedComposed, additionalTags, removeTags)
+	if err != nil {
+		response.Fatal(rsp, err)
+		return rsp, nil
+	}
 
-		field, ok := ManagedField(desired, resourceFilter)
-		if !ok {
-			f.log.Debug("skipping resource that doesn't support tags", "resource", string(name), "gvk", desired.Resource.GroupVersionKind().String())
-			continue
-		}
+	for name, p := range plans {
+		desired := desiredComposed[name]
 
-		err := MergeTags(desired, additionalTags, field)
+		err := MergeTags(desired, additionalTags, p.field)
 		if err != nil {
 			f.log.Debug("error adding tags", "resource", string(name), "error", err.Error())
 		}
 
-		// Ignore tags only if there is an existing Composed resource with tags in the status
-		if observed, ok := observedComposed[name]; ok {
-			ignoreTags := f.ResolveIgnoreTags(in.IgnoreTags, oxr, &observed, env, field)
-			if ignoreTags != nil {
-				err := MergeTags(desired, *ignoreTags, field)
-				if err != nil {
-					f.log.Debug("error adding tags to ignore", "resource", string(name), "error", err.Error())
-				}
+		if p.ignoreTags != nil {
+			err := MergeTags(desired, *p.ignoreTags, p.field)
+			if err != nil {
+				f.log.Debug("error adding tags to ignore", "resource", string(name), "error", err.Error())
 			}
 		}
 
 		// Remove tags
 		if len(removeTags) > 0 {
-			err := RemoveTags(desired, removeTags, field)
+			err := RemoveTags(desired, removeTags, p.field)
 			if err != nil {
 				f.log.Debug("error removing tags", "resource", string(name), "error", err.Error())
 			}
@@ -131,6 +124,60 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) 
 	response.Normalf(rsp, "Successfully Processed tags")
 
 	return rsp, nil
+}
+
+// TagPlan is what the Function will do to a desired composed resource.
+type TagPlan struct {
+	// field is the spec.forProvider field that holds the resource's tags.
+	field string
+	// ignoreTags are tags to take from the observed resource.
+	ignoreTags *TagUpdater
+}
+
+// PlanTags decides which of the desired composed resources the Function will
+// change, and returns an error if the tags it would add aren't valid for the
+// resource's provider.
+func (f *Function) PlanTags(in *v1beta1.ManagedTags, oxr *resource.Composite, env *unstructured.Unstructured, desiredComposed map[resource.Name]*resource.DesiredComposed, observedComposed map[resource.Name]resource.ObservedComposed, additionalTags TagUpdater, removeTags []string) (map[resource.Name]TagPlan, error) {
+	resourceFilter := filters.NewResourceFilter()
+	resourceRules := filters.NewResourceRules()
+	plans := make(map[resource.Name]TagPlan, len(desiredComposed))
+
+	for name, desired := range desiredComposed {
+		if IgnoreResource(desired) {
+			f.log.Debug("skipping resource due to ignore annotation or label", "resource", string(name), "gvk", desired.Resource.GroupVersionKind().String())
+			continue
+		}
+
+		field, ok := ManagedField(desired, resourceFilter)
+		if !ok {
+			f.log.Debug("skipping resource that doesn't support tags", "resource", string(name), "gvk", desired.Resource.GroupVersionKind().String())
+			continue
+		}
+
+		p := TagPlan{field: field}
+
+		// Ignore tags only if there is an existing Composed resource with tags in the status
+		if observed, ok := observedComposed[name]; ok {
+			p.ignoreTags = f.ResolveIgnoreTags(in.IgnoreTags, oxr, &observed, env, field)
+		}
+
+		rules, ok := ManagedRules(desired, resourceRules)
+		if ok {
+			adding := []v1beta1.Tags{additionalTags.Retain, additionalTags.Replace}
+			if p.ignoreTags != nil {
+				adding = append(adding, p.ignoreTags.Retain, p.ignoreTags.Replace)
+			}
+
+			err := ValidateTags(desired, rules, field, adding, removeTags)
+			if err != nil {
+				return nil, errors.Wrapf(err, "invalid tags for composed resource %q (%s)", string(name), groupKind(desired))
+			}
+		}
+
+		plans[name] = p
+	}
+
+	return plans, nil
 }
 
 // IgnoreResource whether this resource has a label or annotation set to ignore.

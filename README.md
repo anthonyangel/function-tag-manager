@@ -210,9 +210,16 @@ Some things to be aware of:
   `userLabels` on `monitoring` resources and `resourceLabels` on `container/Cluster`. These
   resources are not managed by this function. Likewise, the `tags` fields on some GCP resources are
   network tags or resource manager tags, not labels, and are never changed.
-- GCP label keys and values must be lowercase letters, numbers, underscores or dashes, and no more
-  than 63 characters. The function doesn't validate them, so a key such as `Environment` will be
-  rejected by GCP when the resource is created.
+- GCP has requirements for labels, and the function checks the labels it adds to GCP resources
+  against them: keys are 1 to 63 characters, start with a lowercase letter, and, like values,
+  contain only lowercase letters (international characters are allowed), numbers, underscores and
+  dashes. Values can be empty and are at most 63 characters. A resource can have at most 64 labels.
+  If a label breaks a requirement, the function returns a fatal result that names the composed
+  resource, the label and the requirement, and no resources are changed by that step. This applies
+  to every GCP resource in the Composition, so a key such as `Environment` that is fine for AWS will
+  stop the pipeline when it is added to a GCP resource. Labels that were already on the resource
+  before the function ran are not checked, but they count towards the limit of 64. AWS and Azure
+  tags are not validated.
 - GCP `labels` are non-authoritative: labels added to a resource outside of Crossplane don't cause
   drift. `ignoreTags` still reads `status.atProvider.labels`, which holds the labels that Crossplane
   is managing on the resource.
